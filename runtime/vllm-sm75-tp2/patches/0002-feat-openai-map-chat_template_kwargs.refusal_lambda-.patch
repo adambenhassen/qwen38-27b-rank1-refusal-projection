@@ -1,0 +1,93 @@
+From 9c4357603a8d575f09607f95affffba05832ea18 Mon Sep 17 00:00:00 2001
+From: Adam Benhassen <adambenhassen@hotmail.com>
+Date: Sat, 10 Oct 2026 01:16:49 +0200
+Subject: [PATCH 2/2] feat(openai): map chat_template_kwargs.refusal_lambda to
+ the refusal cache salt
+
+Clients that cannot send cache_salt (pi) select the refusal projection
+strength per request through chat_template_kwargs. Only when the dial is
+enabled and no explicit salt is given; lambda must lie in [-1, 4].
+---
+ tests/v1/worker/test_refusal_projection.py    | 27 +++++++++++++++++++
+ .../openai/chat_completion/protocol.py        | 23 ++++++++++++++++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/tests/v1/worker/test_refusal_projection.py b/tests/v1/worker/test_refusal_projection.py
+index c48c8f5898..57b1800335 100644
+--- a/tests/v1/worker/test_refusal_projection.py
++++ b/tests/v1/worker/test_refusal_projection.py
+@@ -182,3 +182,30 @@ def test_refusal_state_unknown_layout_uses_global(rp):
+     # Adaptive verification: real token count below the CPU upper bound.
+     state.fill(np.array([0]), np.array([4], dtype=np.int32), 2, 0.0)
+     assert torch.all(rp._tok_buf == 0.0)
++
++
++def _chat(**extra):
++    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
++
++    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], **extra}
++    return ChatCompletionRequest.model_validate(body)
++
++
++def test_chat_kwarg_maps_to_cache_salt(rp):
++    req = _chat(chat_template_kwargs={"refusal_lambda": 1, "reasoning_effort": "xhigh"})
++    assert req.cache_salt == "refusal:1.0"
++    assert rp.parse_request_lambda(req.cache_salt) == 1.0
++    # An explicit salt wins; no kwarg means no salt.
++    assert _chat(cache_salt="abc", chat_template_kwargs={"refusal_lambda": 1}).cache_salt == "abc"
++    assert _chat(chat_template_kwargs={"reasoning_effort": "low"}).cache_salt is None
++
++
++@pytest.mark.parametrize("bad", ["x", 9, float("nan")])
++def test_chat_kwarg_rejects_bad_lambda(rp, bad):
++    with pytest.raises(Exception, match="refusal_lambda"):
++        _chat(chat_template_kwargs={"refusal_lambda": bad})
++
++
++def test_chat_kwarg_ignored_without_dial(monkeypatch):
++    monkeypatch.delenv("VLLM_REFUSAL_DIRS", raising=False)
++    assert _chat(chat_template_kwargs={"refusal_lambda": 1}).cache_salt is None
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index b7b292e835..0dc07419ef 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -41,6 +41,8 @@ from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
+ from vllm.exceptions import VLLMValidationError
+ from vllm.logger import init_logger
+ from vllm.logprobs import Logprob
++from vllm.refusal_projection import SALT_PREFIX as REFUSAL_SALT_PREFIX
++from vllm.refusal_projection import is_enabled as refusal_is_enabled
+ from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
+ from vllm.sampling_params import (
+     BeamSearchParams,
+@@ -526,6 +528,27 @@ class ChatCompletionRequest(OpenAIBaseModel):
+     def check_cache_salt_support(cls, data: Any) -> Any:
+         if not isinstance(data, dict):
+             return data
++        # Clients that cannot send cache_salt (e.g. pi) select the refusal
++        # projection strength through chat_template_kwargs instead.
++        kwargs = data.get("chat_template_kwargs")
++        if (
++            data.get("cache_salt") is None
++            and isinstance(kwargs, dict)
++            and kwargs.get("refusal_lambda") is not None
++            and refusal_is_enabled()
++        ):
++            try:
++                lam = float(kwargs["refusal_lambda"])
++            except (TypeError, ValueError):
++                lam = float("nan")
++            # Same range as /admin/refusal_lambda; NaN fails the comparison.
++            if not -1.0 <= lam <= 4.0:
++                raise VLLMValidationError(
++                    "chat_template_kwargs.refusal_lambda must be a number "
++                    "between -1 and 4.",
++                    parameter="chat_template_kwargs",
++                )
++            data["cache_salt"] = f"{REFUSAL_SALT_PREFIX}{lam}"
+         validate_cache_salt(data.get("cache_salt"))
+         return data
+ 
+-- 
+2.56.0
+

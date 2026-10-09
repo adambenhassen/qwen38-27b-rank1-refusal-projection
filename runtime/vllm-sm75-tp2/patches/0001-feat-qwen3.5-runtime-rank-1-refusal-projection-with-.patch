@@ -1,0 +1,955 @@
+From 1a2f871eb0256533e410a9e23521712ef75b3981 Mon Sep 17 00:00:00 2001
+From: Adam Benhassen <adambenhassen@hotmail.com>
+Date: Sat, 10 Oct 2026 01:05:06 +0200
+Subject: [PATCH 1/2] feat(qwen3.5): runtime rank-1 refusal projection with
+ per-request lambda
+
+Project each residual writer's output (linear_attn.out_proj, self_attn.o_proj,
+mlp.down_proj) with y - lambda * coef * r (r . y), loaded from
+VLLM_REFUSAL_DIRS. Port of pocharlies-org/qwen38-27b-rank1-refusal-projection
+(Apache-2.0) to this fork's V2 model runner.
+
+- Per request via cache_salt "refusal:<x>"; global via
+  POST /admin/refusal_lambda, which resets the prefix cache and returns 409
+  while requests hold KV.
+- lambda and the per-token buffer are module buffers mutated in place, so
+  CUDA graphs and AOT-loaded artifacts read live values.
+- VLLM_REFUSAL_DIRS joins the compile hash; fails closed on unclaimed or
+  double-claimed directions. The MTP drafter is not projected.
+---
+ tests/v1/worker/test_refusal_projection.py   | 184 +++++++++++++
+ vllm/entrypoints/serve/__init__.py           |   6 +
+ vllm/entrypoints/serve/refusal/__init__.py   |   0
+ vllm/entrypoints/serve/refusal/api_router.py | 114 ++++++++
+ vllm/envs.py                                 |  11 +
+ vllm/model_executor/models/qwen3_5.py        |  25 ++
+ vllm/model_executor/models/qwen3_next.py     |  10 +
+ vllm/refusal_projection.py                   | 274 +++++++++++++++++++
+ vllm/v1/core/sched/output.py                 |   4 +
+ vllm/v1/worker/gpu/model_runner.py           |  18 ++
+ vllm/v1/worker/gpu/refusal_utils.py          |  60 ++++
+ vllm/v1/worker/gpu_worker.py                 |  12 +
+ 12 files changed, 718 insertions(+)
+ create mode 100644 tests/v1/worker/test_refusal_projection.py
+ create mode 100644 vllm/entrypoints/serve/refusal/__init__.py
+ create mode 100644 vllm/entrypoints/serve/refusal/api_router.py
+ create mode 100644 vllm/refusal_projection.py
+ create mode 100644 vllm/v1/worker/gpu/refusal_utils.py
+
+diff --git a/tests/v1/worker/test_refusal_projection.py b/tests/v1/worker/test_refusal_projection.py
+new file mode 100644
+index 0000000000..c48c8f5898
+--- /dev/null
++++ b/tests/v1/worker/test_refusal_projection.py
+@@ -0,0 +1,184 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU tests for the runtime rank-1 refusal projection."""
++
++import importlib
++import json
++import struct
++
++import numpy as np
++import pytest
++import torch
++
++HIDDEN = 16
++LAYERS = 4
++STEM = "model.language_model.layers."
++
++
++def _write_dirs(path, modules, seed=0):
++    g = torch.Generator().manual_seed(seed)
++    tensors = {}
++    for m in modules:
++        r = torch.randn(HIDDEN, generator=g)
++        tensors[m] = r / r.norm()
++    coefs = torch.linspace(0.9, 1.3, len(modules))
++    header, blobs, off = {}, [], 0
++    for name, t in [*tensors.items(), ("__coefs__", coefs)]:
++        b = t.to(torch.float32).numpy().tobytes()
++        header[name] = {"dtype": "F32", "shape": list(t.shape), "data_offsets": [off, off + len(b)]}
++        blobs.append(b)
++        off += len(b)
++    header["__metadata__"] = {"coef_order": json.dumps(list(modules))}
++    h = json.dumps(header).encode()
++    path.write_bytes(struct.pack("<Q", len(h)) + h + b"".join(blobs))
++    return tensors, {m: float(coefs[i]) for i, m in enumerate(modules)}
++
++
++def _all_modules():
++    out = []
++    for i in range(LAYERS):
++        attn = "self_attn.o_proj" if i % 4 == 3 else "linear_attn.out_proj"
++        out += [f"{STEM}{i}.{attn}", f"{STEM}{i}.mlp.down_proj"]
++    return out
++
++
++@pytest.fixture
++def rp(tmp_path, monkeypatch):
++    """Fresh module state with a direction file covering every layer."""
++    path = tmp_path / "dirs.safetensors"
++    dirs, coefs = _write_dirs(path, _all_modules())
++    monkeypatch.setenv("VLLM_REFUSAL_DIRS", str(path))
++    monkeypatch.setenv("VLLM_REFUSAL_LAMBDA_INIT", "0.0")
++    import vllm.refusal_projection as mod
++
++    mod = importlib.reload(mod)
++    mod.dirs_for_test, mod.coefs_for_test = dirs, coefs
++    yield mod
++    monkeypatch.delenv("VLLM_REFUSAL_DIRS")
++    importlib.reload(mod)
++
++
++def _claim_all(rp, prefix_fmt):
++    got = {}
++    for i in range(LAYERS):
++        attn = "self_attn.o_proj" if i % 4 == 3 else "linear_attn.out_proj"
++        for sub in (attn, "mlp.down_proj"):
++            got[(i, sub)] = rp.resolve_direction(prefix_fmt.format(i), sub)
++    return got
++
++
++@pytest.mark.parametrize(
++    "prefix_fmt", ["model.layers.{}", "language_model.model.layers.{}"]
++)
++def test_runtime_prefixes_claim_every_direction(rp, prefix_fmt):
++    got = _claim_all(rp, prefix_fmt)
++    assert all(v is not None for v in got.values())
++    rp.verify_all_consumed()
++
++
++def test_mtp_layers_are_never_projected(rp):
++    assert rp.resolve_direction("mtp.layers.0", "mlp.down_proj") is None
++    assert rp.resolve_direction("model.mtp.layers.0", "mlp.down_proj") is None
++
++
++def test_unclaimed_direction_fails_closed(rp):
++    rp.resolve_direction("model.layers.0", "mlp.down_proj")
++    with pytest.raises(RuntimeError, match="not claimed"):
++        rp.verify_all_consumed()
++
++
++def test_double_claim_fails_closed(rp):
++    rp.resolve_direction("model.layers.0", "mlp.down_proj")
++    with pytest.raises(RuntimeError, match="claimed twice"):
++        rp.resolve_direction("language_model.model.layers.0", "mlp.down_proj")
++
++
++def test_lambda_zero_is_bit_exact_and_one_matches_weight_edit(rp):
++    key = f"{STEM}0.mlp.down_proj"
++    r, coef = rp.dirs_for_test[key], rp.coefs_for_test[key]
++    proj = rp.RefusalProjection(r, coef, device=torch.device("cpu"))
++    w = torch.randn(HIDDEN, 32, dtype=torch.float64)
++    x = torch.randn(5, 32, dtype=torch.float64)
++    y = (x @ w.T).to(torch.bfloat16)
++    assert torch.equal(proj(y), y)
++
++    rp.set_lambda(1.0)
++    r64 = r.to(torch.float64)
++    w_edit = w - coef * torch.outer(r64, r64) @ w
++    want = x @ w_edit.T
++    got = proj((x @ w.T).to(torch.float32)).to(torch.float64)
++    torch.testing.assert_close(got, want, atol=1e-4, rtol=1e-4)
++
++
++def test_per_token_buffer_drives_rows_and_set_lambda_mutates_in_place(rp):
++    rp.ensure_token_buffer(8, torch.device("cpu"))
++    key = f"{STEM}0.mlp.down_proj"
++    r, coef = rp.dirs_for_test[key], rp.coefs_for_test[key]
++    proj = rp.RefusalProjection(r, coef, device=torch.device("cpu"))
++    assert proj.use_tok and proj.tok.data_ptr() == rp._tok_buf.data_ptr()
++
++    y = torch.randn(3, HIDDEN) + 3 * r
++    rp.fill_tokens(torch.tensor([0.0, 1.0, 0.0]), global_lambda=0.0)
++    out = proj(y)
++    assert torch.equal(out[0], y[0]) and torch.equal(out[2], y[2])
++    assert abs(float(out[1] @ r) - float(y[1] @ r) * (1 - coef)) < 1e-4
++
++    # Global lambda tensor is shared with the module, not copied.
++    lam_ptr = proj.lam.data_ptr()
++    rp.set_lambda(0.5)
++    assert proj.lam.data_ptr() == lam_ptr and float(proj.lam) == 0.5
++
++
++def test_fill_tokens_never_truncates(rp):
++    rp.ensure_token_buffer(4, torch.device("cpu"))
++    rp.fill_tokens(torch.ones(6), global_lambda=0.25)
++    assert torch.all(rp._tok_buf == 0.25)
++
++
++def test_compiled_forward_reads_live_buffers(rp):
++    rp.ensure_token_buffer(8, torch.device("cpu"))
++    key = f"{STEM}0.mlp.down_proj"
++    proj = rp.RefusalProjection(
++        rp.dirs_for_test[key], rp.coefs_for_test[key], device=torch.device("cpu")
++    )
++    compiled = torch.compile(proj, fullgraph=True, backend="aot_eager")
++    y = torch.randn(4, HIDDEN)
++    rp.fill_neutral(0.0)
++    assert torch.equal(compiled(y), y)
++    rp.fill_neutral(1.0)
++    assert not torch.equal(compiled(y), y)
++    torch.testing.assert_close(compiled(y), proj(y))
++
++
++def test_parse_request_lambda(rp):
++    assert rp.parse_request_lambda("refusal:1.0") == 1.0
++    assert rp.parse_request_lambda("refusal:abc") is None
++    assert rp.parse_request_lambda("other-salt") is None
++    assert rp.parse_request_lambda(None) is None
++
++
++def test_refusal_state_expands_per_request_lambdas(rp):
++    from vllm.v1.worker.gpu import refusal_utils
++
++    importlib.reload(refusal_utils)
++    state = refusal_utils.RefusalState(4, 8, torch.device("cpu"))
++    state.add_request(0, None)
++    state.add_request(2, 1.0)
++    # Batch order: slot 2 (3 tokens), slot 0 (2 tokens); 3 padding rows.
++    state.fill(np.array([2, 0]), np.array([3, 2], dtype=np.int32), 5, 0.25)
++    assert rp._tok_buf.tolist() == [1.0, 1.0, 1.0, 0.25, 0.25, 0.25, 0.25, 0.25]
++
++    state.remove_request(2)
++    state.fill(np.array([2]), np.array([1], dtype=np.int32), 1, 0.0)
++    assert rp._tok_buf[0].item() == 0.0
++
++
++def test_refusal_state_unknown_layout_uses_global(rp):
++    from vllm.v1.worker.gpu import refusal_utils
++
++    importlib.reload(refusal_utils)
++    state = refusal_utils.RefusalState(2, 8, torch.device("cpu"))
++    state.add_request(0, 1.0)
++    # Adaptive verification: real token count below the CPU upper bound.
++    state.fill(np.array([0]), np.array([4], dtype=np.int32), 2, 0.0)
++    assert torch.all(rp._tok_buf == 0.0)
+diff --git a/vllm/entrypoints/serve/__init__.py b/vllm/entrypoints/serve/__init__.py
+index c358b9a6db..39404742ee 100644
+--- a/vllm/entrypoints/serve/__init__.py
++++ b/vllm/entrypoints/serve/__init__.py
+@@ -39,6 +39,12 @@ def register_vllm_serve_api_routers(app: FastAPI):
+ 
+     attach_tokenize_router(app)
+ 
++    from vllm.entrypoints.serve.refusal.api_router import (
++        attach_router as attach_refusal_router,
++    )
++
++    attach_refusal_router(app)
++
+ 
+ def register_vllm_dev_api_routers(app: FastAPI):
+     logger.warning(
+diff --git a/vllm/entrypoints/serve/refusal/__init__.py b/vllm/entrypoints/serve/refusal/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/vllm/entrypoints/serve/refusal/api_router.py b/vllm/entrypoints/serve/refusal/api_router.py
+new file mode 100644
+index 0000000000..76294c74d0
+--- /dev/null
++++ b/vllm/entrypoints/serve/refusal/api_router.py
+@@ -0,0 +1,114 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Runtime control of the refusal projection's global lambda.
++
++  POST /admin/refusal_lambda   {"lambda": 1.0}
++  GET  /admin/refusal_lambda
++
++Mounted only when VLLM_REFUSAL_DIRS is set. Per-request lambda
++(cache_salt="refusal:<x>") does not need this endpoint.
++
++The value goes to every worker through collective_rpc (with TP=2 the API
++server and the workers are different processes) and all ranks must agree.
++
++Requests without a salt share prefix-cache blocks computed at the global
++lambda, so changing it resets the prefix cache. The reset only succeeds with
++no request holding KV; if it fails the old lambda is restored and the call
++returns 409.
++"""
++
++from fastapi import APIRouter, Depends, FastAPI, Request
++from fastapi.responses import JSONResponse
++from pydantic import BaseModel, Field
++
++from vllm.engine.protocol import EngineClient
++from vllm.entrypoints.serve.utils.api_utils import validate_json_request
++from vllm.logger import init_logger
++from vllm.refusal_projection import is_enabled
++
++logger = init_logger(__name__)
++
++router = APIRouter()
++
++# 0 = unmodified model, 1 = measured operating point. Above ~1.5 quality
++# drops; at 2.5 refusals return and generation runs away.
++LAMBDA_MIN = -1.0
++LAMBDA_MAX = 4.0
++
++
++class RefusalLambdaRequest(BaseModel):
++    lambda_: float = Field(..., alias="lambda", ge=LAMBDA_MIN, le=LAMBDA_MAX)
++
++    model_config = {"populate_by_name": True}
++
++
++def engine_client(request: Request) -> EngineClient:
++    return request.app.state.engine_client
++
++
++async def _set_all_ranks(raw_request: Request, value: float) -> list | None:
++    """Per-rank results, or None if any rank disagrees."""
++    results = await engine_client(raw_request).collective_rpc(
++        "set_refusal_lambda", args=(value,)
++    )
++    applied = [r for r in results if r is not None]
++    if not applied or any(abs(r - value) > 1e-9 for r in applied):
++        logger.error("refusal lambda: ranks disagree after setting %s: %s", value, results)
++        return None
++    return applied
++
++
++@router.post("/admin/refusal_lambda", dependencies=[Depends(validate_json_request)])
++async def set_refusal_lambda(request: RefusalLambdaRequest, raw_request: Request):
++    value = float(request.lambda_)
++    previous = await engine_client(raw_request).collective_rpc("get_refusal_lambda")
++
++    applied = await _set_all_ranks(raw_request, value)
++    if applied is None:
++        return JSONResponse(
++            status_code=500,
++            content={"error": "ranks did not apply the same lambda", "requested": value},
++        )
++
++    if not await engine_client(raw_request).reset_prefix_cache():
++        old = float(previous[0])
++        if await _set_all_ranks(raw_request, old) is None:
++            return JSONResponse(
++                status_code=500,
++                content={"error": "prefix cache busy and lambda rollback failed"},
++            )
++        return JSONResponse(
++            status_code=409,
++            content={
++                "error": "prefix cache in use; lambda left at previous value. "
++                "Retry when idle or use cache_salt='refusal:<x>' per request.",
++                "lambda": old,
++            },
++        )
++
++    logger.info("refusal lambda set to %s on %d ranks", value, len(applied))
++    return JSONResponse(content={"lambda": value, "ranks": len(applied)})
++
++
++@router.get("/admin/refusal_lambda")
++async def get_refusal_lambda(raw_request: Request):
++    results = await engine_client(raw_request).collective_rpc("get_refusal_lambda")
++    vals = [r for r in results if r is not None]
++    consistent = bool(vals) and all(abs(r - vals[0]) <= 1e-9 for r in vals)
++    return JSONResponse(
++        content={
++            "lambda": vals[0] if consistent else None,
++            "consistent": consistent,
++            "per_rank": results,
++        }
++    )
++
++
++def attach_router(app: FastAPI):
++    if not is_enabled():
++        return
++    logger.warning(
++        "Refusal projection enabled: /admin/refusal_lambda mounted. It changes "
++        "model behaviour at runtime; do not expose it publicly."
++    )
++    app.include_router(router)
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 77a3642539..cd763c17e0 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -319,6 +319,8 @@ if TYPE_CHECKING:
+     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
+     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
+     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
++    VLLM_REFUSAL_DIRS: str | None = None
++    VLLM_REFUSAL_LAMBDA_INIT: float = 0.0
+     VLLM_LOG_MODEL_INSPECTION: bool = False
+     VLLM_DEBUG_MFU_METRICS: bool = False
+     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
+@@ -2123,6 +2125,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
+         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
+     ),
++    # Direction file for the runtime rank-1 refusal projection (Qwen3.5/3.8).
++    # Unset = no projection modules are built. Changes the compiled graph.
++    "VLLM_REFUSAL_DIRS": lambda: os.getenv("VLLM_REFUSAL_DIRS", None),
++    # Startup value of the projection's global lambda (0 = unmodified model).
++    "VLLM_REFUSAL_LAMBDA_INIT": lambda: float(
++        os.getenv("VLLM_REFUSAL_LAMBDA_INIT", "0.0")
++    ),
+     # Log model inspection after loading.
+     # If enabled, logs a transformers-style hierarchical view of the model
+     # with quantization methods and attention backends.
+@@ -2342,6 +2351,8 @@ def compile_factors() -> dict[str, object]:
+ 
+     ignored_factors: set[str] = {
+         "MAX_JOBS",
++        # Runtime tensor value, not graph structure.
++        "VLLM_REFUSAL_LAMBDA_INIT",
+         "VLLM_RPC_BASE_PATH",
+         "VLLM_USE_MODELSCOPE",
+         "VLLM_RINGBUFFER_WARNING_INTERVAL",
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index fe960984b6..265c7ca587 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -30,6 +30,7 @@ import torch
+ from torch import nn
+ 
+ from vllm.compilation.decorators import support_torch_compile
++from vllm import refusal_projection
+ from vllm.config import VllmConfig
+ from vllm.distributed import (
+     get_pp_group,
+@@ -203,6 +204,26 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
+                 ),
+             )
+ 
++        self.refusal_attn: nn.Module | None = None
++        self.refusal_mlp: nn.Module | None = None
++        if refusal_projection.is_enabled():
++            attn_sub = (
++                "linear_attn.out_proj"
++                if self.layer_type == "linear_attention"
++                else "self_attn.o_proj"
++            )
++            device = self.input_layernorm.weight.device
++            got_attn = refusal_projection.resolve_direction(prefix, attn_sub)
++            got_mlp = refusal_projection.resolve_direction(prefix, "mlp.down_proj")
++            if got_attn is not None:
++                self.refusal_attn = refusal_projection.RefusalProjection(
++                    *got_attn, device=device
++                )
++            if got_mlp is not None:
++                self.refusal_mlp = refusal_projection.RefusalProjection(
++                    *got_mlp, device=device
++                )
++
+ 
+ @support_torch_compile(
+     dynamic_arg_dims={
+@@ -259,6 +280,10 @@ class Qwen3_5Model(Qwen3NextModel):
+         self.start_layer, self.end_layer, self.layers = make_layers(
+             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
+         )
++        if refusal_projection.is_enabled() and (
++            self.start_layer == 0 and self.end_layer == config.num_hidden_layers
++        ):
++            refusal_projection.verify_all_consumed()
+         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
+             self.layers,
+             Qwen3NextSparseMoeBlock,
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+index 495650eb19..c7f19368f1 100644
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -545,6 +545,10 @@ class Qwen3NextDecoderLayer(nn.Module):
+                 ),
+             )
+ 
++        # Set by Qwen3_5DecoderLayer when the runtime refusal projection is on.
++        self.refusal_attn: nn.Module | None = None
++        self.refusal_mlp: nn.Module | None = None
++
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+@@ -574,6 +578,9 @@ class Qwen3NextDecoderLayer(nn.Module):
+         else:
+             raise ValueError("Invalid layer_type")
+ 
++        if self.refusal_attn is not None:
++            hidden_states = self.refusal_attn(hidden_states)
++
+         if self.layer_scale:
+             if len(hidden_states.shape) == 2:
+                 hidden_states = hidden_states * (
+@@ -602,6 +609,9 @@ class Qwen3NextDecoderLayer(nn.Module):
+         else:
+             hidden_states = self.mlp(hidden_states)
+ 
++        if self.refusal_mlp is not None:
++            hidden_states = self.refusal_mlp(hidden_states)
++
+         if self.layer_scale:
+             if len(hidden_states.shape) == 2:
+                 hidden_states = hidden_states * (
+diff --git a/vllm/refusal_projection.py b/vllm/refusal_projection.py
+new file mode 100644
+index 0000000000..29335b8a4d
+--- /dev/null
++++ b/vllm/refusal_projection.py
+@@ -0,0 +1,274 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Runtime rank-1 refusal projection for Qwen3.5/3.8 dense models.
++
++Port of github.com/pocharlies-org/qwen38-27b-rank1-refusal-projection
++(Apache-2.0, runtime/vllm-0.27.1/payload/refusal_projection.py).
++
++Every module that writes to the residual stream gets
++
++    y <- y - lam * coef_m * r_m * (r_m . y)
++
++on its output, which equals editing the weight to (W - lam * coef_m * r r^T W)
++without touching the checkpoint. lam=0 is the unmodified model; lam=1
++reproduces the per-layer profile of the abliterated source checkpoint.
++
++Enabled only when VLLM_REFUSAL_DIRS points at the direction file. Without it
++no module is built and the forward has no extra branch.
++
++lam sources:
++  * global: VLLM_REFUSAL_LAMBDA_INIT at startup, POST /admin/refusal_lambda
++    at runtime.
++  * per request: cache_salt="refusal:<float>". The salt is already part of the
++    prefix-cache block hash, so KV computed at different lam never mixes.
++
++CUDA graphs and AOT compile: lam lives in device tensors registered as
++non-persistent buffers and is only ever mutated in place. A Python float would
++be baked into the captured graph and changing it would silently do nothing.
++The per-token buffer is created by the V2 model runner before the model is
++built, so each projection binds it at construction and the forward only slices
++it.
++
++The MTP drafter is never projected (the source checkpoint has no mtp.*
++tensors). That costs draft acceptance on ablated requests, not correctness.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++import struct
++import threading
++
++import torch
++import torch.nn as nn
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++ENV_DIRS = "VLLM_REFUSAL_DIRS"
++ENV_LAMBDA = "VLLM_REFUSAL_LAMBDA_INIT"
++SALT_PREFIX = "refusal:"
++
++# Key stem of the direction file. Runtime prefixes differ per wrapper
++# (model.layers.N, language_model.model.layers.N), so only the layer index is
++# taken from the runtime prefix.
++_CKPT_STEM = "model.language_model.layers."
++_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
++
++_lock = threading.Lock()
++_dirs: dict[str, torch.Tensor] | None = None
++_coefs: dict[str, float] | None = None
++_consumed: set[str] = set()
++_seen_prefixes: set[str] = set()
++_lam_by_device: dict[torch.device, torch.Tensor] = {}
++_lam_value: float = float(os.environ.get(ENV_LAMBDA, "0.0"))
++_tok_buf: torch.Tensor | None = None
++_warned_capacity: set[tuple[int, int]] = set()
++
++
++def is_enabled() -> bool:
++    return bool(os.environ.get(ENV_DIRS))
++
++
++def _load_dirs(path: str) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
++    """Minimal safetensors reader: one F32 vector per module plus `__coefs__`,
++    paired by the explicit `coef_order` metadata, never by implicit order."""
++    with open(path, "rb") as fh:
++        n = struct.unpack("<Q", fh.read(8))[0]
++        header = json.loads(fh.read(n))
++        blob = fh.read()
++
++    def _tensor(key: str) -> torch.Tensor:
++        m = header[key]
++        if m["dtype"] != "F32":
++            raise ValueError(f"{path}: {key} is {m['dtype']}, expected F32")
++        a, b = m["data_offsets"]
++        return torch.frombuffer(bytearray(blob[a:b]), dtype=torch.float32).clone()
++
++    if "__coefs__" not in header:
++        raise ValueError(f"{path}: missing `__coefs__` (per-module coefficients)")
++    dirs = {k: _tensor(k) for k in header if k not in ("__metadata__", "__coefs__")}
++    order = json.loads(header.get("__metadata__", {})["coef_order"])
++    cv = _tensor("__coefs__")
++    if len(order) != len(cv) or set(order) != set(dirs):
++        raise ValueError(
++            f"{path}: coef_order ({len(order)}) does not match directions ({len(dirs)})"
++        )
++    return dirs, {m: float(cv[i]) for i, m in enumerate(order)}
++
++
++def _ensure_loaded() -> tuple[dict[str, torch.Tensor] | None, dict[str, float] | None]:
++    global _dirs, _coefs
++    path = os.environ.get(ENV_DIRS)
++    if not path:
++        return None, None
++    with _lock:
++        if _dirs is None:
++            _dirs, _coefs = _load_dirs(path)
++            logger.info(
++                "refusal projection: %d directions loaded from %s (coef %.4f..%.4f)",
++                len(_dirs),
++                path,
++                min(_coefs.values()),
++                max(_coefs.values()),
++            )
++    return _dirs, _coefs
++
++
++def resolve_direction(prefix: str, sublayer: str) -> tuple[torch.Tensor, float] | None:
++    """(r_hat, coef) for `<prefix>.<sublayer>`, or None if it is not projected."""
++    dirs, coefs = _ensure_loaded()
++    if dirs is None or coefs is None:
++        return None
++    _seen_prefixes.add(prefix)
++    lowered = prefix.lower()
++    # The MTP drafter reuses the decoder-layer class and also starts at index 0;
++    # without this it would claim backbone layer 0's direction.
++    if "mtp" in lowered or "draft" in lowered:
++        return None
++    m = _LAYER_RE.search(prefix)
++    if m is None:
++        return None
++    key = f"{_CKPT_STEM}{int(m.group(1))}.{sublayer}"
++    if key not in dirs:
++        return None
++    if key in _consumed:
++        # A layer projected twice is 2*lam while the claim count still reads full.
++        raise RuntimeError(f"refusal projection: {key} claimed twice")
++    _consumed.add(key)
++    return dirs[key], coefs[key]
++
++
++def verify_all_consumed() -> None:
++    """Fail closed: a half-ablated model raises no error and just behaves oddly."""
++    dirs, _ = _ensure_loaded()
++    if dirs is None:
++        return
++    orphan = sorted(set(dirs) - _consumed)
++    if orphan:
++        raise RuntimeError(
++            f"refusal projection: {len(orphan)} directions not claimed by any "
++            f"layer, e.g. {orphan[:3]}; runtime prefixes seen: "
++            f"{sorted(_seen_prefixes)[:3]}. Refusing to serve a half-ablated model."
++        )
++    logger.info("refusal projection: %d/%d directions claimed", len(_consumed), len(dirs))
++
++
++# ------------------------------------------------------------------ lambda state
++
++
++def get_lambda_tensor(device: torch.device) -> torch.Tensor:
++    """Global lam for `device`, shared by every layer. Construction time only."""
++    with _lock:
++        t = _lam_by_device.get(device)
++        if t is None:
++            # Created outside inference mode so it can be mutated in place later.
++            with torch.inference_mode(False):
++                t = torch.tensor(_lam_value, device=device, dtype=torch.float32)
++            _lam_by_device[device] = t
++        return t
++
++
++def set_lambda(value: float) -> float:
++    """Global lam, mutated in place on every device (safe after graph capture)."""
++    global _lam_value
++    with _lock, torch.inference_mode(False):
++        for t in _lam_by_device.values():
++            t.fill_(value)
++        _lam_value = float(value)
++        return _lam_value
++
++
++def get_lambda() -> float:
++    return _lam_value
++
++
++def parse_request_lambda(cache_salt: str | None) -> float | None:
++    """`refusal:<float>` -> lam; None if the salt is not ours or does not parse."""
++    if not cache_salt or not cache_salt.startswith(SALT_PREFIX):
++        return None
++    try:
++        return float(cache_salt[len(SALT_PREFIX) :])
++    except ValueError:
++        logger.warning("cache_salt %r does not parse as a lambda; ignored", cache_salt)
++        return None
++
++
++def ensure_token_buffer(max_num_tokens: int, device: torch.device) -> None:
++    """Per-token lam buffer. Must exist before the model is built and captured."""
++    global _tok_buf
++    if not is_enabled():
++        return
++    with _lock:
++        if _tok_buf is None:
++            with torch.inference_mode(False):
++                _tok_buf = torch.full(
++                    (max_num_tokens,), _lam_value, dtype=torch.float32, device=device
++                )
++            logger.info(
++                "refusal projection: per-token buffer ready (%d tokens, %s)",
++                max_num_tokens,
++                device,
++            )
++
++
++def fill_tokens(tok: torch.Tensor, global_lambda: float) -> None:
++    """Real rows get `tok`, padding rows the global lam."""
++    buf = _tok_buf
++    if buf is None:
++        return
++    n = int(tok.shape[0])
++    cap = int(buf.shape[0])
++    if n > cap:
++        # Never truncate: that would hand one request another request's lam.
++        if (n, cap) not in _warned_capacity:
++            _warned_capacity.add((n, cap))
++            logger.warning(
++                "refusal projection: batch needs %d rows, buffer has %d; "
++                "using the global lambda for this batch",
++                n,
++                cap,
++            )
++        fill_neutral(global_lambda)
++        return
++    with torch.inference_mode(False):
++        buf[:n].copy_(tok, non_blocking=True)
++        if cap > n:
++            buf[n:].fill_(float(global_lambda))
++
++
++def fill_neutral(global_lambda: float) -> None:
++    """Whole buffer to the global lam (dummy/profile runs)."""
++    if _tok_buf is None:
++        return
++    with torch.inference_mode(False):
++        _tok_buf.fill_(float(global_lambda))
++
++
++# ------------------------------------------------------------------ the module
++
++
++class RefusalProjection(nn.Module):
++    """y <- y - lam * coef * r * (r . y); dot product in fp32."""
++
++    def __init__(self, r_hat: torch.Tensor, coef: float, *, device: torch.device):
++        super().__init__()
++        self.register_buffer(
++            "r_hat", r_hat.to(device=device, dtype=torch.float32), persistent=False
++        )
++        self.coef = float(coef)
++        # Buffers, not plain attributes, so AOT-loaded graphs read the live
++        # tensors instead of values serialized at compile time.
++        self.register_buffer("lam", get_lambda_tensor(device), persistent=False)
++        self.use_tok = _tok_buf is not None
++        if self.use_tok:
++            self.register_buffer("tok", _tok_buf, persistent=False)
++
++    def forward(self, y: torch.Tensor) -> torch.Tensor:
++        r = self.r_hat
++        proj = y.to(torch.float32) @ r
++        lam = self.tok[: proj.shape[0]] if self.use_tok else self.lam
++        return y - (lam * self.coef * proj).unsqueeze(-1).to(y.dtype) * r.to(y.dtype)
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 87fdbfb164..d91957541b 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
+ 
+ from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
+ from vllm.multimodal.utils import strip_covered_mm_data
++from vllm.refusal_projection import parse_request_lambda
+ 
+ if TYPE_CHECKING:
+     import numpy as np
+@@ -48,6 +49,8 @@ class NewRequestData:
+ 
+     # Only used for v2 model runner.
+     prefill_token_ids: list[int] | None = None
++    # Refusal projection strength from cache_salt="refusal:<float>".
++    refusal_lambda: float | None = None
+ 
+     @classmethod
+     def from_request(
+@@ -73,6 +76,7 @@ class NewRequestData:
+             prompt_embeds=request.prompt_embeds,
+             prompt_is_token_ids=request.prompt_is_token_ids,
+             prefill_token_ids=prefill_token_ids,
++            refusal_lambda=parse_request_lambda(request.cache_salt),
+         )
+ 
+     @property
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 0422c9e885..df1f17df1b 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -29,6 +29,7 @@ import torch
+ import torch.nn as nn
+ 
+ import vllm.envs as envs
++from vllm import refusal_projection
+ from vllm.compilation.counter import compilation_counter
+ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.config import VllmConfig
+@@ -143,6 +144,7 @@ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
+ from vllm.v1.worker.gpu.model_states import init_model_state
+ from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
+ from vllm.v1.worker.gpu.pp_utils import PPHandler
++from vllm.v1.worker.gpu.refusal_utils import RefusalState
+ from vllm.v1.worker.gpu.sample.batch_shard import (
+     BatchSharder,
+     all_to_all_logits,
+@@ -346,6 +348,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         # LoRA-related workers.
+         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
++        self.refusal_state = RefusalState(
++            max_num_reqs=self.max_num_reqs,
++            max_num_tokens=self.max_num_tokens,
++            device=self.device,
++        )
+         self.lora_capture_cases = [0]
+         if self.lora_config:
+             self.lora_capture_cases = get_lora_capture_cases(
+@@ -1108,6 +1115,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         if self.prompt_logprobs_worker is not None:
+             self.prompt_logprobs_worker.remove_request(req_id)
+         self.lora_state.remove_request(req_id)
++        self.refusal_state.remove_request(req_idx)
+         return True
+ 
+     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
+@@ -1179,6 +1187,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 req_index, new_req_data.block_ids, overwrite=True
+             )
+             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
++            self.refusal_state.add_request(req_index, new_req_data.refusal_lambda)
+ 
+             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
+                 assert self.sampler is not None
+@@ -1761,7 +1770,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     input_batch.num_scheduled_tokens,
+                 )
+                 self._set_active_loras(*lora_inputs)
++            if refusal_projection.is_enabled():
++                self.refusal_state.fill(
++                    input_batch.idx_mapping_np,
++                    input_batch.num_scheduled_tokens,
++                    input_batch.num_tokens,
++                    refusal_projection.get_lambda(),
++                )
+         else:
++            if refusal_projection.is_enabled():
++                self.refusal_state.fill_neutral(refusal_projection.get_lambda())
+             # No actual tokens to run. A dummy run for DP or memory profiling.
+             dummy_num_reqs = batch_desc.num_reqs or num_reqs
+             input_batch = InputBatch.make_dummy(
+diff --git a/vllm/v1/worker/gpu/refusal_utils.py b/vllm/v1/worker/gpu/refusal_utils.py
+new file mode 100644
+index 0000000000..bd4d66b07e
+--- /dev/null
++++ b/vllm/v1/worker/gpu/refusal_utils.py
+@@ -0,0 +1,60 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-request lambda of the runtime refusal projection (Model Runner V2).
++
++Mirrors LoraState: the same idx_mapping / num_scheduled_tokens of the batch
++expand per-request lambdas into the per-token buffer bound by every
++RefusalProjection module.
++"""
++
++import numpy as np
++import torch
++
++from vllm import refusal_projection
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++# NaN = the request carried no lambda; use the server's global value.
++NO_LAMBDA = np.nan
++
++
++class RefusalState:
++    def __init__(self, max_num_reqs: int, max_num_tokens: int, device: torch.device):
++        self.lambdas = np.full(max_num_reqs, NO_LAMBDA, dtype=np.float32)
++        # Created here, before the model is built and before CUDA graph capture.
++        refusal_projection.ensure_token_buffer(max_num_tokens, device)
++        self._warned_layout = False
++
++    def add_request(self, req_index: int, refusal_lambda: float | None) -> None:
++        self.lambdas[req_index] = NO_LAMBDA if refusal_lambda is None else refusal_lambda
++
++    def remove_request(self, req_index: int) -> None:
++        self.lambdas[req_index] = NO_LAMBDA
++
++    def fill(
++        self,
++        idx_mapping: np.ndarray,
++        num_scheduled_tokens: np.ndarray,
++        num_tokens: int,
++        global_lambda: float,
++    ) -> None:
++        """Row i of the buffer <-> token i of the batch."""
++        if int(num_scheduled_tokens.sum()) != num_tokens:
++            # Adaptive verification compacts tokens on the GPU only, so the CPU
++            # layout is an upper bound. Never guess: use the global lambda.
++            if not self._warned_layout:
++                self._warned_layout = True
++                logger.warning(
++                    "refusal projection: token layout is not known on the CPU "
++                    "(adaptive verification); per-request lambda is ignored"
++                )
++            refusal_projection.fill_neutral(global_lambda)
++            return
++        lam = self.lambdas[idx_mapping]
++        lam = np.where(np.isnan(lam), np.float32(global_lambda), lam)
++        tok = np.repeat(lam, num_scheduled_tokens)
++        refusal_projection.fill_tokens(torch.from_numpy(tok), global_lambda)
++
++    def fill_neutral(self, global_lambda: float) -> None:
++        refusal_projection.fill_neutral(global_lambda)
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index f0e00ce9c1..cf0b512cfd 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -240,6 +240,18 @@ class Worker(WorkerBase):
+             )
+         return self._sleep_mode_backend
+ 
++    def set_refusal_lambda(self, value: float) -> float:
++        from vllm.refusal_projection import set_lambda
++
++        applied = set_lambda(float(value))
++        logger.info("refusal lambda = %s (rank %s)", applied, self.rank)
++        return applied
++
++    def get_refusal_lambda(self) -> float:
++        from vllm.refusal_projection import get_lambda
++
++        return get_lambda()
++
+     def sleep(self, level: int = 1) -> None:
+         torch.accelerator.synchronize()
+         free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
+-- 
+2.56.0
+

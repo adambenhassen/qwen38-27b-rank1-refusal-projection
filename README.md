@@ -10,6 +10,15 @@ speculative decoding k=3, `--max-model-len 65536`.
 Direction vectors and model card:
 [`pocharlies/qwen38-27b-uncensored-abliterated-refusal-directions`](https://huggingface.co/pocharlies/qwen38-27b-uncensored-abliterated-refusal-directions).
 
+### Third runtime: vLLM on Turing, TP=2 (2× RTX 2080 Ti) — 2026-10-10
+
+[`runtime/vllm-sm75-tp2/`](runtime/vllm-sm75-tp2/) ports the dial
+to a Turing (SM75) vLLM build serving Swift-1.5 INT4/INT8 fine-tunes with MTP k=3.
+Same directions and the same `cache_salt` seal. Also a `chat_template_kwargs.refusal_lambda`
+path for clients without `cache_salt`, and a global-λ change that resets the prefix cache
+(the upstream hash key does not update under TP=2). λ=1 costs 4% single-stream and
+1–2% at 8 concurrent. λ=0 is at compile-noise level, not bit-exact.
+
 ### Second runtime: SGLang + DSpark — 2026-08-29
 
 The dial is no longer tied to vLLM. [`runtime/sglang-dspark/`](runtime/sglang-dspark/)

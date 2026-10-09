@@ -1,0 +1,22 @@
+{
+  "providers": {
+    "my-vllm": {
+      "models": [
+        {
+          "id": "qwen3.8-27b-int4-uncensored",
+          "name": "Qwen3.8-27B INT4 · refusal dial λ=1",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 262144,
+          "compat": {
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": {
+              "reasoning_effort": {},
+              "refusal_lambda": 1
+            }
+          }
+        }
+      ]
+    }
+  }
+}
