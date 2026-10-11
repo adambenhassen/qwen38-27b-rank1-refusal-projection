@@ -9,8 +9,10 @@ coefficients, same meaning of λ, same `cache_salt: "refusal:<x>"` seal.
 
 ## Source
 
-Two commits on top of the SM75 vLLM source tree (branch
-[`refusal-dial`](https://github.com/adambenhassen/vLLM-2080Ti-Definitive/tree/refusal-dial)),
+Two commits on top of the SM75 vLLM source tree
+([`1a2f871eb0`](https://github.com/adambenhassen/vLLM-2080Ti-Definitive/commit/1a2f871eb0) and
+[`9c4357603a`](https://github.com/adambenhassen/vLLM-2080Ti-Definitive/commit/9c4357603a) on branch
+[`sm75-fixes`](https://github.com/adambenhassen/vLLM-2080Ti-Definitive/tree/sm75-fixes)),
 also in [`patches/`](patches/):
 
 | patch | what |
